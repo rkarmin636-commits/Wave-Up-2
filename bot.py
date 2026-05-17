@@ -5,13 +5,14 @@ try:
 except ImportError:
     pass
 
+VERSION  = 'V5.16.3'
 TOKEN    = os.environ.get('BOT_TOKEN','8774016221:AAGN3Ue10KPdlKXxCgnYHncgOQ1mVhwSnUI')
 CHAT_ID  = os.environ.get('CHAT_ID','-1002383423317')
 TOPIC    = int(os.environ.get('TOPIC','282961'))
 LOGIN_ID = os.environ.get('LOGIN_ID','959969637971')
 PASSWORD = os.environ.get('PASSWORD','Waiyan203654')
 API_BASE = "https://6lotteryapi.com/api/webapi"
-STATE_FILE   = 'wai1_state.json'
+STATE_FILE   = 'waveup_state.json'
 GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN','')
 GITHUB_REPO  = 'rkarmin636-commits/Wave-Up-Bot'
 EXPORT_FILE  = 'bot_state_export.json'
@@ -30,7 +31,7 @@ PW_SEQ4_CONF_B,PW_SEQ4_CONF_S=0.67,0.65
 PW_SEQ5_CONF_B,PW_SEQ5_CONF_S=0.70,0.68
 PW_STREAK_CONF_B=0.64; PW_STREAK_CONF_S=0.62
 CONF_FLOOR=0.55; ANTI_MOM_W=10; POST_WIN_ROUNDS=3
-MINI_RECAL_WINDOW=50; EMERGENCY_RECAL_AT=3; FORCE_SWITCH_AT=5
+MINI_RECAL_WINDOW=50
 ACCURACY_WINDOW=20; ACCURACY_FLOOR=0.45
 PREDICTOR_TRACK_N=30; PREDICTOR_MIN_PREDS=10
 BASE_WEIGHTS={'S5':4.0,'S4':3.0,'S3':2.5,'ST':2.0,'SW':1.5,'AM':0.8}
@@ -41,7 +42,14 @@ REV_PROB={
 }
 REV_WARNING_THRESHOLD=0.60; MOM_THRESHOLD=0.42
 
-logging.basicConfig(level=logging.INFO,format='%(asctime)s - %(levelname)s - %(message)s',handlers=[logging.StreamHandler(sys.stdout)])
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('waveup_bot.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 logger=logging.getLogger(__name__)
 
 def normalize_issue(issue):
@@ -58,14 +66,13 @@ class WaveUpBot:
         self.calibrated_patterns={}; self.last_calibration_at=0
         self.wins=0; self.losses_total=0; self.post_win_rounds=0
         self.pre_win_loss_streak=0; self.last_win_side=None
-        self.last_emergency_recal=0; self.last_bot_direction=None
         self.prediction_log=[]
         self.predictor_log={'S5':[],'S4':[],'S3':[],'ST':[],'SW':[],'AM':[]}
         self.pred_count_b=0; self.pred_count_s=0
         self.rev_warning_active=False; self.rev_warning_side=None
         self.rev_warning_prob=0.0; self.rev_confirmed=False
         self._load_state()
-        logger.info(f"V5.16.2 Ready! history={len(self.result_history)} total={self.total_results} wins={self.wins} losses={self.losses_total}")
+        logger.info(f"{VERSION} Ready! history={len(self.result_history)} total={self.total_results} wins={self.wins} losses={self.losses_total}")
 
     def _save_state(self):
         state={'consecutive_losses':self.consecutive_losses,'bet_counter':self.bet_counter,
@@ -77,7 +84,6 @@ class WaveUpBot:
                'pre_win_loss_streak':self.pre_win_loss_streak,'last_win_side':self.last_win_side,
                'calibrated_patterns':self.calibrated_patterns,'last_calibration_at':self.last_calibration_at,
                'wins':self.wins,'losses_total':self.losses_total,'bootstrapped':self.bootstrapped,
-               'last_emergency_recal':self.last_emergency_recal,'last_bot_direction':self.last_bot_direction,
                'prediction_log':self.prediction_log[-50:],
                'predictor_log':{k:v[-PREDICTOR_TRACK_N:] for k,v in self.predictor_log.items()},
                'pred_count_b':self.pred_count_b,'pred_count_s':self.pred_count_s,
@@ -115,8 +121,6 @@ class WaveUpBot:
                 self.last_calibration_at=state.get('last_calibration_at',0)
                 self.wins=state.get('wins',0); self.losses_total=state.get('losses_total',0)
                 self.bootstrapped=state.get('bootstrapped',False)
-                self.last_emergency_recal=state.get('last_emergency_recal',0)
-                self.last_bot_direction=state.get('last_bot_direction',None)
                 self.prediction_log=state.get('prediction_log',[])
                 saved_plog=state.get('predictor_log',{})
                 for k in self.predictor_log: self.predictor_log[k]=saved_plog.get(k,[])
@@ -228,7 +232,10 @@ class WaveUpBot:
     def bootstrap_history(self):
         if self.bootstrapped: logger.info("Already bootstrapped."); return True
         logger.info("Bootstrapping 500 historical results...")
-        if not self.auth_token and not self.login(): logger.warning("Bootstrap: login failed"); return False
+        if not self.auth_token and not self.login():
+            logger.warning("Bootstrap: login failed — sending Telegram alert")
+            self.send_msg(f"⚠️ {VERSION} Bootstrap failed: login error. Running in Phase 1.")
+            return False
         all_results=[]
         try:
             params={"pageSize":500,"pageNo":1,"typeId":13,"language":0,"random":str(int(time.time()*1_000_000))}
@@ -253,7 +260,10 @@ class WaveUpBot:
                     else: break
                     time.sleep(0.5)
                 except Exception as e: logger.warning(f"Bootstrap page {page} error: {e}"); break
-        if not all_results: logger.warning("Bootstrap: no data"); return False
+        if not all_results:
+            logger.warning("Bootstrap: no data")
+            self.send_msg(f"⚠️ {VERSION} Bootstrap: no historical data. Running in Phase 1.")
+            return False
         all_results=list(reversed(all_results))[-500:]
         parsed=[]
         for g in all_results:
@@ -261,7 +271,10 @@ class WaveUpBot:
                 num=int(g.get('number',-1))
                 if num>=0: parsed.append('B' if num>=5 else 'S')
             except: continue
-        if len(parsed)<50: logger.warning("Bootstrap: not enough results"); return False
+        if len(parsed)<50:
+            logger.warning("Bootstrap: not enough results")
+            self.send_msg(f"⚠️ {VERSION} Bootstrap: only {len(parsed)} results. Running in Phase 1.")
+            return False
         self.result_history=parsed[-ROLLING_MAX:]; self.total_results=len(self.result_history)
         self.bootstrapped=True; logger.info(f"Bootstrap done: {len(self.result_history)} results")
         self.calibrate(); self._save_state(); return True
@@ -400,7 +413,9 @@ class WaveUpBot:
 
     def _anti_momentum(self,games):
         w=self.calibrated_patterns.get('best_anti_w',ANTI_MOM_W)
-        if not games or len(games)<w: w=ANTI_MOM_W
+        # FIX: guard against games shorter than window
+        if not games or len(games)<w: w=min(ANTI_MOM_W,len(games)) if games else 0
+        if w==0: return None,0.0
         try: b=sum(1 for i in range(w) if int(games[i].get('number',-1))>=5)
         except: return None,0.0
         acc=self.calibrated_patterns.get('best_anti_acc',0.55)
@@ -408,19 +423,9 @@ class WaveUpBot:
         elif b<w/2: return 'B',acc
         return None,0.0
 
-    def _force_switch_prediction(self):
-        if self.last_bot_direction:
-            switched='B' if self.last_bot_direction=='S' else 'S'
-            logger.info(f"FORCE SWITCH loss={self.consecutive_losses} -> {switched}"); return switched
-        hist=self.result_history
-        return ('B' if hist[-1]=='S' else 'S') if hist else None
-
     def predict(self,games):
         phase=self._get_phase(); n=self.total_results; w=len(self.result_history)
         caution=self.post_win_rounds>0
-        if self.consecutive_losses>=FORCE_SWITCH_AT:
-            forced=self._force_switch_prediction()
-            if forced: return forced,'FS',f"FORCE {n} w{w}",''
         if phase==1 or not self.calibrated_patterns:
             if not games or len(games)<ANTI_MOM_W:
                 return None,'N',f"collecting {n}/{PHASE2_START}",''
@@ -482,7 +487,7 @@ class WaveUpBot:
         else:
             agreeing=[(v,wt,lbl) for v,wt,lbl in candidates if v==pred]
             mode=max(agreeing,key=lambda x:x[1])[2] if agreeing else 'AM'
-            if caution and mode not in ('S5','FS'): mode+='*'
+            if caution and mode not in ('S5',): mode+='*'
         if pred=='B': self.pred_count_b+=1
         else: self.pred_count_s+=1
         self.rev_confirmed=False
@@ -523,7 +528,9 @@ class WaveUpBot:
 
     def _export_to_github(self):
         token=GITHUB_TOKEN
-        if not token: return
+        if not token:
+            logger.info("GitHub export skipped: GITHUB_TOKEN not set")
+            return
         try:
             hist=self.result_history; n=len(hist); sc=hist.count('S'); bc=hist.count('B')
             max_s=max_b=cs2=cb2=0
@@ -547,7 +554,7 @@ class WaveUpBot:
                 return d
             total_t=self.wins+self.losses_total; win_rate=round(self.wins/total_t*100,1) if total_t>0 else 0
             pred_total=self.pred_count_b+self.pred_count_s
-            export={'version':'V5.16.2','exported_at':datetime.datetime.utcnow().isoformat()+'Z',
+            export={'version':VERSION,'exported_at':datetime.datetime.utcnow().isoformat()+'Z',
                     'last_sent_sig':self.last_sent_sig,'last_sent_time':self.last_sent_time,
                     'phase':self._get_phase(),'total_results':self.total_results,'rolling_window':n,
                     'wins':self.wins,'losses_total':self.losses_total,'win_rate_pct':win_rate,
@@ -569,7 +576,7 @@ class WaveUpBot:
                     headers={'Authorization':f'token {token}'},timeout=10)
                 if r.status_code==200: sha=r.json().get('sha')
             except: pass
-            payload={'message':f'V5.16.2 export: {self.total_results} results W{self.wins}/L{self.losses_total} ({win_rate}%)',
+            payload={'message':f'{VERSION} export: {self.total_results} results W{self.wins}/L{self.losses_total} ({win_rate}%)',
                      'content':base64.b64encode(export_json.encode()).decode()}
             if sha: payload['sha']=sha
             r=requests.put(f"https://api.github.com/repos/{GITHUB_REPO}/contents/{EXPORT_FILE}",
@@ -579,7 +586,7 @@ class WaveUpBot:
         except Exception as e: logger.warning(f"GitHub export error: {e}")
 
     def run(self):
-        logger.info("Wave Up Bot V5.16.2 Running...")
+        logger.info(f"Wave Up Bot {VERSION} Running...")
         while True:
             try:
                 games=self.get_live_data()
@@ -600,7 +607,7 @@ class WaveUpBot:
                     if self.last_prediction==actual:
                         self.pre_win_loss_streak=self.consecutive_losses; self.last_win_side=actual
                         self.consecutive_losses=0; self.bet_counter=0; self.post_win_rounds=POST_WIN_ROUNDS
-                        self.wins+=1; self.last_emergency_recal=0
+                        self.wins+=1
                         if self.last_sent_win!=issue:
                             win_sent=self.send_msg("\U0001f308\U0001f3c6\U0001f947W I N\U0001f37e\U0001f37a\U0001f943\U0001f377\U0001f378\U0001f379\U0001f37b\U0001f942")
                             if win_sent: self.last_sent_win=issue
@@ -608,13 +615,10 @@ class WaveUpBot:
                     else:
                         self.consecutive_losses+=1; self.losses_total+=1
                         if self.post_win_rounds>0: self.post_win_rounds-=1
-                        if self.consecutive_losses>=EMERGENCY_RECAL_AT and self.consecutive_losses!=self.last_emergency_recal:
-                            self.mini_calibrate(label=f"emergency-{self.consecutive_losses}"); self.last_emergency_recal=self.consecutive_losses
                         self._check_accuracy_floor()
                     self.last_prediction=None; self.last_pred_issue=None; self.last_pred_mode=None
                     if self._should_calibrate(): self.calibrate()
                     self._save_state()
-                # DUPLICATE FIX: check before predict()
                 next_issue_full=normalize_issue(str(int(issue)+1))
                 now=time.time()
                 if self.last_sent_sig==next_issue_full:
@@ -636,7 +640,7 @@ class WaveUpBot:
                 if sent:
                     self.last_sent_sig=next_issue_full; self.last_sent_time=now
                     self.last_prediction=prediction; self.last_pred_issue=next_issue_full
-                    self.last_pred_mode=mode; self.last_bot_direction=prediction
+                    self.last_pred_mode=mode
                     logger.info(f"Signal: Trx {next_issue} {pred_text} [{mode}] W{self.wins}/L{self.losses_total}")
                 self.last_issue=issue; self._save_state(); time.sleep(5)
             except KeyboardInterrupt: logger.info("Stopped"); raise
@@ -645,7 +649,7 @@ class WaveUpBot:
 def main():
     bot=WaveUpBot()
     try:
-        if not bot.bootstrap_history(): logger.warning("Bootstrap failed, continuing")
+        if not bot.bootstrap_history(): logger.warning("Bootstrap failed, continuing in Phase 1")
     except Exception as e: logger.warning(f"Bootstrap exception: {e}")
     bot.run()
 
